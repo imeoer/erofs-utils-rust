@@ -1,0 +1,11 @@
+[package]
+name = "mkfs-erofs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+uuid = { version = "1", features = ["v4"] }
+crc32c = "0.6"

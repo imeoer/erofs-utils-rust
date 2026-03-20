@@ -1,0 +1,78 @@
+use crate::ondisk::{
+    EROFS_BLOCK_SIZE, EROFS_DIRENT_SIZE, EROFS_FT_DIR,
+    serialize_dirent,
+};
+
+/// A directory child entry with name, NID, and file type.
+pub struct DirChild {
+    pub name: String,
+    pub nid: u64,
+    pub file_type: u8,
+}
+
+/// Serialize directory entries into block-aligned data.
+///
+/// Entries are sorted alphabetically.  "." and ".." are prepended.
+/// Each block is independently formatted: dirent array followed by names.
+///
+/// Returns the serialized directory data (multiple of EROFS_BLOCK_SIZE).
+pub fn serialize_directory(
+    children: &[DirChild],
+    self_nid: u64,
+    parent_nid: u64,
+) -> Vec<u8> {
+    let block_size = EROFS_BLOCK_SIZE as usize;
+
+    // Build full entry list: "." + ".." + sorted children
+    let mut entries: Vec<(&str, u64, u8)> = Vec::with_capacity(children.len() + 2);
+    entries.push((".", self_nid, EROFS_FT_DIR));
+    entries.push(("..", parent_nid, EROFS_FT_DIR));
+    // Children are already sorted by the caller
+    for c in children {
+        entries.push((&c.name, c.nid, c.file_type));
+    }
+
+    let mut result = Vec::new();
+    let mut idx = 0;
+
+    while idx < entries.len() {
+        // Determine how many entries fit in this block
+        let block_start = idx;
+        let mut dirent_area = 0usize;
+        let mut name_area = 0usize;
+
+        while idx < entries.len() {
+            let new_dirent_area = (idx - block_start + 1) * EROFS_DIRENT_SIZE;
+            let new_name_area = name_area + entries[idx].0.len();
+            if new_dirent_area + new_name_area > block_size {
+                break;
+            }
+            dirent_area = new_dirent_area;
+            name_area = new_name_area;
+            idx += 1;
+        }
+
+        let count = idx - block_start;
+        assert!(count > 0, "directory entry too large for a single block");
+
+        // Build this block
+        let mut block = vec![0u8; block_size];
+        let names_start = count * EROFS_DIRENT_SIZE;
+        let mut name_offset = names_start;
+
+        for i in 0..count {
+            let (name, nid, ft) = entries[block_start + i];
+            let de = serialize_dirent(nid, name_offset as u16, ft);
+            let de_offset = i * EROFS_DIRENT_SIZE;
+            block[de_offset..de_offset + EROFS_DIRENT_SIZE].copy_from_slice(&de);
+            let name_bytes = name.as_bytes();
+            block[name_offset..name_offset + name_bytes.len()].copy_from_slice(name_bytes);
+            name_offset += name_bytes.len();
+        }
+        // Rest of block is already zeroed
+        let _ = dirent_area; // used for size check above
+        result.extend_from_slice(&block);
+    }
+
+    result
+}
