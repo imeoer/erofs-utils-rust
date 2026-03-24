@@ -3,9 +3,30 @@ name = "mkfs-erofs"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "erofs-mkfs"
+path = "src/bin/erofs-mkfs.rs"
+
+[[bin]]
+name = "erofs-fuse"
+path = "src/bin/erofs-fuse.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 uuid = { version = "1", features = ["v4"] }
 crc32c = "0.6"
+libc = "0.2"
+log = "0.4"
+memmap2 = "0.9"
+simple_logger = "4"
+signal-hook = "0.3"
+tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "rt-multi-thread"] }
+async-trait = "0.1"
+fuse-backend-rs = { path = "../fuse-backend-rs", features = ["fusedev", "async-io"] }
+xattr = "1"
+
+[features]
+default = ["async-io"]
+async-io = []

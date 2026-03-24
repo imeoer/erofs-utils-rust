@@ -1,6 +1,6 @@
-use crate::ondisk::{
+use crate::metadata::{
     EROFS_BLOCK_SIZE, EROFS_DIRENT_SIZE, EROFS_FT_DIR,
-    serialize_dirent,
+    ErofsDirent,
 };
 
 /// A directory child entry with name, NID, and file type.
@@ -23,11 +23,9 @@ pub fn serialize_directory(
 ) -> Vec<u8> {
     let block_size = EROFS_BLOCK_SIZE as usize;
 
-    // Build full entry list: "." + ".." + sorted children
     let mut entries: Vec<(&str, u64, u8)> = Vec::with_capacity(children.len() + 2);
     entries.push((".", self_nid, EROFS_FT_DIR));
     entries.push(("..", parent_nid, EROFS_FT_DIR));
-    // Children are already sorted by the caller
     for c in children {
         entries.push((&c.name, c.nid, c.file_type));
     }
@@ -36,7 +34,6 @@ pub fn serialize_directory(
     let mut idx = 0;
 
     while idx < entries.len() {
-        // Determine how many entries fit in this block
         let block_start = idx;
         let mut dirent_area = 0usize;
         let mut name_area = 0usize;
@@ -55,22 +52,20 @@ pub fn serialize_directory(
         let count = idx - block_start;
         assert!(count > 0, "directory entry too large for a single block");
 
-        // Build this block
         let mut block = vec![0u8; block_size];
         let names_start = count * EROFS_DIRENT_SIZE;
         let mut name_offset = names_start;
 
         for i in 0..count {
             let (name, nid, ft) = entries[block_start + i];
-            let de = serialize_dirent(nid, name_offset as u16, ft);
+            let de = ErofsDirent::new(nid, name_offset as u16, ft);
             let de_offset = i * EROFS_DIRENT_SIZE;
-            block[de_offset..de_offset + EROFS_DIRENT_SIZE].copy_from_slice(&de);
+            block[de_offset..de_offset + EROFS_DIRENT_SIZE].copy_from_slice(de.as_bytes());
             let name_bytes = name.as_bytes();
             block[name_offset..name_offset + name_bytes.len()].copy_from_slice(name_bytes);
             name_offset += name_bytes.len();
         }
-        // Rest of block is already zeroed
-        let _ = dirent_area; // used for size check above
+        let _ = dirent_area;
         result.extend_from_slice(&block);
     }
 

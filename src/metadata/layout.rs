@@ -1,4 +1,4 @@
-use crate::ondisk::{EROFS_BLOCK_SIZE, EROFS_SLOTSIZE};
+use super::{EROFS_BLOCK_SIZE, EROFS_SLOTSIZE};
 
 /// Metadata layout allocator.
 ///
@@ -24,20 +24,15 @@ impl MetadataLayout {
         Self {
             buf: Vec::new(),
             cursor: 0,
-            meta_blkaddr: 1, // metadata starts at block 1
+            meta_blkaddr: 1,
         }
     }
 
     /// Allocate space for an inode. Returns `(offset_in_buf, nid)`.
-    ///
-    /// The allocation is aligned to EROFS_SLOTSIZE (32 bytes).
-    /// `size` is the total inode metadata size in bytes
-    /// (inode header + extent data + inline data).
     pub fn alloc_inode(&mut self, size: usize) -> (usize, u64) {
         let aligned = round_up_usize(size, EROFS_SLOTSIZE as usize);
         let offset = self.cursor;
         self.cursor += aligned;
-        // Extend the buffer to cover the new allocation
         if self.buf.len() < self.cursor {
             self.buf.resize(self.cursor, 0);
         }
@@ -46,7 +41,6 @@ impl MetadataLayout {
     }
 
     /// Pad the metadata buffer to the next block boundary.
-    /// Returns the current cursor (which is now block-aligned).
     pub fn pad_to_block(&mut self) -> usize {
         let aligned = round_up_usize(self.cursor, EROFS_BLOCK_SIZE as usize);
         self.cursor = aligned;
@@ -59,7 +53,6 @@ impl MetadataLayout {
     /// Allocate block-aligned space for directory data.
     /// Returns (offset_in_buf, start_block_address).
     pub fn alloc_dir_data(&mut self, size: usize) -> (usize, u64) {
-        // Ensure block alignment
         self.cursor = round_up_usize(self.cursor, EROFS_BLOCK_SIZE as usize);
         let offset = self.cursor;
         let aligned_size = round_up_usize(size, EROFS_BLOCK_SIZE as usize);

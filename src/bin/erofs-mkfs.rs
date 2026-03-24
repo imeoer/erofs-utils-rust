@@ -1,10 +1,3 @@
-mod blobchunk;
-mod dir;
-mod inode;
-mod layout;
-mod ondisk;
-mod superblock;
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -13,17 +6,17 @@ use std::time::SystemTime;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use blobchunk::BlobWriter;
-use dir::{serialize_directory, DirChild};
-use inode::{
+use mkfs_erofs::build::blobchunk::BlobWriter;
+use mkfs_erofs::build::dir::{serialize_directory, DirChild};
+use mkfs_erofs::build::inode::{
     build_tree, inode_meta_size, serialize_inode, InodeData, InodeInfo,
 };
-use layout::MetadataLayout;
-use ondisk::*;
-use superblock::write_image;
+use mkfs_erofs::build::image::write_image;
+use mkfs_erofs::metadata::layout::MetadataLayout;
+use mkfs_erofs::metadata::*;
 
 #[derive(Parser)]
-#[command(name = "mkfs.erofs", about = "Create an EROFS filesystem image (chunk-based)")]
+#[command(name = "erofs-mkfs", about = "Create an EROFS filesystem image (chunk-based)")]
 struct Args {
     /// Output image file path
     image: PathBuf,
@@ -98,7 +91,6 @@ fn main() -> Result<()> {
     // Phase 2b: Serialize and allocate directory data
     layout.pad_to_block();
 
-    // We need to collect directory info before mutating inodes
     let dir_infos: Vec<(usize, Vec<DirChild>, u64, u64)> = inodes
         .iter()
         .enumerate()
@@ -140,7 +132,6 @@ fn main() -> Result<()> {
             *sb = startblk;
             *dds = dir_data_len;
         }
-        // Update inode size to the full directory data size
         inodes[idx].size = dir_data_len as u64;
     }
 
@@ -183,7 +174,6 @@ fn main() -> Result<()> {
 
 /// Set parent_nid for all directory inodes by traversing the tree.
 fn set_parent_nids(inodes: &mut [InodeInfo]) {
-    // Root's parent is itself
     let root_nid = inodes[0].nid;
     if let InodeData::Directory {
         ref mut parent_nid,
@@ -193,7 +183,6 @@ fn set_parent_nids(inodes: &mut [InodeInfo]) {
         *parent_nid = root_nid;
     }
 
-    // For each directory, set its children directories' parent_nid
     let dir_infos: Vec<(u64, Vec<usize>)> = inodes
         .iter()
         .filter_map(|inode| {

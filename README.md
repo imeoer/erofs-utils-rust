@@ -1,6 +1,6 @@
 # erofs-utils-rust
 
-A minimal Rust implementation of `mkfs.erofs` focused on chunk-based image creation.
+A minimal Rust implementation of EROFS filesystem tools, including image creation (`erofs-mkfs`) and FUSE mounting (`erofs-fuse`).
 
 ## Build
 
@@ -8,47 +8,129 @@ A minimal Rust implementation of `mkfs.erofs` focused on chunk-based image creat
 cargo build --release
 ```
 
-The generated binary is:
+Two binaries are generated:
 
 ```bash
-./target/release/mkfs-erofs
+./target/release/erofs-mkfs   # Create EROFS images
+./target/release/erofs-fuse   # Mount EROFS images via FUSE
 ```
 
 ## Usage
 
-Command format:
+### erofs-mkfs
+
+Create an EROFS filesystem image from a source directory:
 
 ```bash
-./target/release/mkfs-erofs IMAGE --blobdev BLOB_IMAGE --chunksize BYTES SOURCE
+./target/release/erofs-mkfs IMAGE --blobdev BLOB --chunksize BYTES SOURCE
 ```
 
 Arguments:
 
 - `IMAGE`: output EROFS metadata image
-- `--blobdev`: output blob data file
-- `--chunksize`: chunk size in bytes, must be a power of two and at least 4096
+- `--blobdev BLOB`: output blob data file (chunk-based data)
+- `--chunksize BYTES`: chunk size in bytes, must be a power of two and >= 4096
 - `SOURCE`: source directory
 
-Example:
+### erofs-fuse
+
+Mount an EROFS image via FUSE:
 
 ```bash
-./target/release/mkfs-erofs /tmp/erofs.meta.img \
+sudo ./target/release/erofs-fuse IMAGE MOUNTPOINT [--blobdev BLOB] [--threads N]
+```
+
+Arguments:
+
+- `IMAGE`: EROFS metadata image file
+- `MOUNTPOINT`: mount point directory
+- `--blobdev BLOB`: blob data file for chunk-based files
+- `--threads N`: number of FUSE worker threads (default: 4)
+
+### Example
+
+```bash
+# Build image
+./target/release/erofs-mkfs /tmp/erofs.meta.img \
 	--blobdev /tmp/erofs.blob.img \
 	--chunksize 1048576 \
 	~/code/linux
+
+# Mount image
+sudo ./target/release/erofs-fuse /tmp/erofs.meta.img ~/mnt \
+	--blobdev /tmp/erofs.blob.img \
+	--threads 10
 ```
+
+## Architecture
+
+```
+src/
+├── bin/
+│   ├── erofs-fuse.rs           # FUSE daemon binary
+│   └── erofs-mkfs.rs           # Image creation binary
+├── lib.rs                       # Library crate root
+├── metadata/                    # EROFS on-disk format definitions (shared)
+│   ├── mod.rs                  # Constants, LE helpers, cast_ref/cast_mut
+│   ├── superblock.rs           # ErofsSuperblock (128B)
+│   ├── inode.rs                # ErofsInodeCompact/Extended, ErofsInode enum
+│   ├── dir.rs                  # ErofsDirent (12B)
+│   ├── chunk.rs                # ErofsChunkIndex (8B), ErofsDeviceSlot (128B)
+│   └── layout.rs               # MetadataLayout allocator
+├── build/                       # Build-time code (image creation)
+│   ├── mod.rs
+│   ├── image.rs                # write_image — assemble final EROFS image
+│   ├── inode.rs                # InodeInfo, build_tree, serialize_inode
+│   ├── dir.rs                  # DirChild, serialize_directory
+│   └── blobchunk.rs            # BlobWriter — chunk dedup + blob writing
+└── fs/                          # Runtime code (image reading + FUSE)
+    ├── mod.rs                  # ErofsReader — mmap + open + common helpers
+    ├── meta.rs                 # Metadata ops: inode, read_dir, read_symlink
+    ├── data.rs                 # Data ops: read_file_data, chunk read, blob pread
+    └── fuse.rs                 # ErofsFs — FileSystem + AsyncFileSystem impl
+```
+
+### Design
+
+- **Zero-copy metadata**: All on-disk structs are `#[repr(C, packed)]` and cast directly from mmap (no parsing/copying)
+- **Lock-free runtime**: `Mmap` (Send+Sync) for metadata, `pread` (POSIX thread-safe) for blob data
+- **Async I/O**: Blob reads offloaded via `tokio::task::spawn_blocking`
+- **Chunk dedup**: BLAKE3-based content-addressed deduplication during image creation
 
 ## Current Scope
 
-This version currently implements only a minimal subset:
+Supported features:
 
-- `--blobdev`
-- `--chunksize`
-- directory input as `SOURCE`
+- Chunk-based image creation with `--blobdev` and `--chunksize`
+- Directory tree as input source
+- Regular files, directories, symlinks, device nodes, FIFOs, sockets
+- Hardlink detection and dedup
+- Extended attributes (xattr) preservation
+- FUSE mount with async I/O and multi-threaded workers
 
-Not supported:
+Not yet supported:
 
 - tar/OCI/S3 inputs
-- compression options
-- xattr and SELinux related options
-- incremental builds
+- Compression (LZ4, ZSTD, etc.)
+- SELinux labels
+- Incremental builds
+
+## Testing
+
+Unit tests:
+
+```bash
+make test
+```
+
+Integration tests (requires root):
+
+```bash
+# Runs verification (~1s) + xfstests regression (~90s).
+# First run installs xfstests dependencies automatically.
+make test-integration
+```
+
+The integration tests live under `tests/integration/` (Go) and reuse
+`tests/scripts/setup_xfstests.sh` for environment setup and
+`tests/scripts/xfstests_erofs.exclude` for the xfstests exclusion list.

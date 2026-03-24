@@ -6,21 +6,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use blake3;
 
-use crate::ondisk::EROFS_BLOCK_SIZE;
+use crate::metadata::EROFS_BLOCK_SIZE;
 
 /// Represents a chunk stored in the blob device.
 #[derive(Clone)]
 struct BlobChunk {
-    /// Block address within the blob device.
     blkaddr: u64,
 }
 
 /// Information about a single chunk index to be stored in an inode.
 #[derive(Clone)]
 pub struct ChunkIndex {
-    /// Block address in the blob device.
     pub blkaddr: u64,
-    /// Device ID (1 for the blobdev).
     pub device_id: u16,
 }
 
@@ -28,11 +25,8 @@ pub struct ChunkIndex {
 pub struct BlobWriter {
     file: File,
     chunksize: u32,
-    /// Current write position in blocks.
     next_blkaddr: u64,
-    /// SHA256 → BlobChunk dedup index.
     dedup: HashMap<[u8; 32], BlobChunk>,
-    /// Total bytes saved by dedup.
     pub saved_by_dedup: u64,
 }
 
@@ -49,14 +43,12 @@ impl BlobWriter {
         })
     }
 
-    /// Total number of blocks written to the blob device.
     pub fn total_blocks(&self) -> u64 {
         self.next_blkaddr
     }
 
-    /// Process a regular file: read it in chunk-sized pieces, dedup via SHA256,
+    /// Process a regular file: read it in chunk-sized pieces, dedup via BLAKE3,
     /// write unique chunks to the blob device.
-    /// Returns a list of ChunkIndex entries for the inode.
     pub fn write_file_chunks(&mut self, path: &Path, file_size: u64) -> Result<Vec<ChunkIndex>> {
         if file_size == 0 {
             return Ok(Vec::new());
@@ -74,15 +66,11 @@ impl BlobWriter {
             let remaining = file_size - i * cs;
             let to_read = remaining.min(cs) as usize;
 
-            // Read actual data
             f.read_exact(&mut chunk_buf[..to_read])
                 .with_context(|| format!("failed to read file: {}", path.display()))?;
 
-            // Only hash the actual data bytes (not padded to chunksize).
-            // The C version also hashes only the real data length per chunk.
             let hash: [u8; 32] = *blake3::hash(&chunk_buf[..to_read]).as_bytes();
 
-            // Actual blocks needed = ceil(to_read / BLOCK_SIZE)
             let write_len = to_read.div_ceil(EROFS_BLOCK_SIZE as usize) * EROFS_BLOCK_SIZE as usize;
             let nblocks = (write_len / EROFS_BLOCK_SIZE as usize) as u64;
 
@@ -91,7 +79,6 @@ impl BlobWriter {
                 existing.blkaddr
             } else {
                 let addr = self.next_blkaddr;
-                // Write actual data + zero-pad to block boundary
                 self.file
                     .write_all(&chunk_buf[..to_read])
                     .context("failed to write to blob device")?;
@@ -108,7 +95,7 @@ impl BlobWriter {
 
             indexes.push(ChunkIndex {
                 blkaddr,
-                device_id: 1, // blobdev is always device 1
+                device_id: 1,
             });
         }
         Ok(indexes)
