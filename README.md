@@ -134,3 +134,13 @@ make test-integration
 The integration tests live under `tests/integration/` (Go) and reuse
 `tests/scripts/setup_xfstests.sh` for environment setup and
 `tests/scripts/xfstests_erofs.exclude` for the xfstests exclusion list.
+
+Performance benchmark (requires root, fio):
+
+```bash
+# Benchmark Rust erofs-fuse (~2min, needs fio: apt-get install fio)
+make test-perf
+
+# Compare against C erofsfuse
+EROFS_C_FUSE=/path/to/erofsfuse make test-perf
+```
