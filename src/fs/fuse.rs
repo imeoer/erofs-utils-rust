@@ -1,6 +1,8 @@
 use std::ffi::CStr;
 use std::io;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64, OpenOptions};
@@ -11,18 +13,28 @@ use async_trait::async_trait;
 
 use crate::metadata::*;
 
-use super::ErofsReader;
+use super::{CachedDirEntry, ErofsReader};
 
 const FUSE_ROOT_ID: u64 = 1;
 const EROFS_FUSE_TIMEOUT: Duration = Duration::from_secs(86400 * 365 * 10);
 
 pub struct ErofsFs {
     reader: Arc<ErofsReader>,
+    dir_handles: Mutex<HashMap<u64, Arc<DirHandle>>>,
+    next_dir_handle: AtomicU64,
+}
+
+struct DirHandle {
+    entries: Vec<CachedDirEntry>,
 }
 
 impl ErofsFs {
     pub fn new(reader: Arc<ErofsReader>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            dir_handles: Mutex::new(HashMap::new()),
+            next_dir_handle: AtomicU64::new(1),
+        }
     }
 
     fn to_nid(&self, ino: u64) -> u64 {
@@ -84,6 +96,40 @@ impl ErofsFs {
 
         st
     }
+
+    fn iterate_dir<F>(&self, inode: u64, mut cb: F) -> io::Result<()>
+    where
+        F: FnMut(u64, u8, &[u8]) -> io::Result<bool>,
+    {
+        let nid = self.to_nid(inode);
+        let vi = self.reader.inode(nid)?;
+        self.reader
+            .for_each_dir_entry(nid, &vi, |entry_nid, file_type, name| {
+                cb(entry_nid, file_type, name)
+            })
+    }
+
+    fn create_dir_handle(&self, inode: u64) -> io::Result<u64> {
+        let nid = self.to_nid(inode);
+        let vi = self.reader.inode(nid)?;
+        let entries = self.reader.read_dir_cached(nid, &vi)?;
+        let handle = self.next_dir_handle.fetch_add(1, Ordering::Relaxed);
+        let dir_handle = Arc::new(DirHandle { entries });
+        self.dir_handles
+            .lock()
+            .unwrap()
+            .insert(handle, dir_handle);
+        Ok(handle)
+    }
+
+    fn get_dir_handle(&self, handle: u64) -> io::Result<Arc<DirHandle>> {
+        self.dir_handles
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))
+    }
 }
 
 impl FileSystem for ErofsFs {
@@ -104,7 +150,7 @@ impl FileSystem for ErofsFs {
             | FsOptions::DO_READDIRPLUS        // READDIRPLUS support
             | FsOptions::READDIRPLUS_AUTO      // auto-READDIRPLUS
             | FsOptions::ASYNC_DIO             // async direct I/O
-            | FsOptions::CACHE_SYMLINKS;       // cache symlink targets
+            | FsOptions::CACHE_SYMLINKS; // cache symlink targets
 
         // Negotiate: only enable what the kernel also supports.
         Ok(capable & want)
@@ -113,18 +159,19 @@ impl FileSystem for ErofsFs {
     fn destroy(&self) {}
 
     fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<Entry> {
-        let parent_nid = self.to_nid(parent);
-        let parent_inode = self.reader.inode(parent_nid)?;
-        let name_str = name
-            .to_str()
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-
-        let entries = self.reader.read_dir(parent_nid, &parent_inode)?;
-        for entry in &entries {
-            if entry.name == name_str {
-                let child_inode = self.reader.inode(entry.nid)?;
-                return Ok(self.make_entry(entry.nid, &child_inode));
+        let target = name.to_bytes();
+        let mut found = None;
+        self.iterate_dir(parent, |entry_nid, _file_type, entry_name| {
+            if entry_name == target {
+                found = Some(entry_nid);
+                return Ok(false);
             }
+            Ok(true)
+        })?;
+
+        if let Some(child_nid) = found {
+            let child_inode = self.reader.inode(child_nid)?;
+            return Ok(self.make_entry(child_nid, &child_inode));
         }
 
         Err(io::Error::from_raw_os_error(libc::ENOENT))
@@ -210,34 +257,27 @@ impl FileSystem for ErofsFs {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
 
-        Ok((Some(nid), OpenOptions::CACHE_DIR))
+        let handle = self.create_dir_handle(inode)?;
+        Ok((Some(handle), OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE))
     }
 
     fn readdir(
         &self,
         _ctx: &Context,
-        inode: u64,
-        _handle: u64,
+        _inode: u64,
+        handle: u64,
         _size: u32,
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
-        let nid = self.to_nid(inode);
-        let vi = self.reader.inode(nid)?;
-        let entries = self.reader.read_dir(nid, &vi)?;
-
-        for (idx, entry) in entries.iter().enumerate() {
-            let idx = idx as u64;
-            if idx < offset {
-                continue;
-            }
-
-            let file_type = erofs_ft_to_dt(entry.file_type);
+        let dir_handle = self.get_dir_handle(handle)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (idx, entry) in dir_handle.entries.iter().enumerate().skip(start) {
             let dir_entry = DirEntry {
                 ino: self.to_ino(entry.nid),
-                offset: idx + 1,
-                type_: file_type,
-                name: entry.name.as_bytes(),
+                offset: idx as u64 + 1,
+                type_: erofs_ft_to_dt(entry.file_type),
+                name: &entry.name,
             };
 
             match add_entry(dir_entry) {
@@ -252,30 +292,22 @@ impl FileSystem for ErofsFs {
     fn readdirplus(
         &self,
         _ctx: &Context,
-        inode: u64,
-        _handle: u64,
+        _inode: u64,
+        handle: u64,
         _size: u32,
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
-        let nid = self.to_nid(inode);
-        let vi = self.reader.inode(nid)?;
-        let entries = self.reader.read_dir(nid, &vi)?;
-
-        for (idx, entry) in entries.iter().enumerate() {
-            let idx = idx as u64;
-            if idx < offset {
-                continue;
-            }
-
+        let dir_handle = self.get_dir_handle(handle)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (idx, entry) in dir_handle.entries.iter().enumerate().skip(start) {
             let child_inode = self.reader.inode(entry.nid)?;
             let fuse_entry = self.make_entry(entry.nid, &child_inode);
-            let file_type = erofs_ft_to_dt(entry.file_type);
             let dir_entry = DirEntry {
                 ino: self.to_ino(entry.nid),
-                offset: idx + 1,
-                type_: file_type,
-                name: entry.name.as_bytes(),
+                offset: idx as u64 + 1,
+                type_: erofs_ft_to_dt(entry.file_type),
+                name: &entry.name,
             };
 
             match add_entry(dir_entry, fuse_entry) {
@@ -287,7 +319,8 @@ impl FileSystem for ErofsFs {
         Ok(())
     }
 
-    fn releasedir(&self, _ctx: &Context, _inode: u64, _flags: u32, _handle: u64) -> io::Result<()> {
+    fn releasedir(&self, _ctx: &Context, _inode: u64, _flags: u32, handle: u64) -> io::Result<()> {
+        self.dir_handles.lock().unwrap().remove(&handle);
         Ok(())
     }
 

@@ -18,6 +18,12 @@ pub struct DirEntry {
     pub name: String,
 }
 
+pub(crate) struct CachedDirEntry {
+    pub nid: u64,
+    pub file_type: u8,
+    pub name: Vec<u8>,
+}
+
 /// EROFS image reader — lock-free, zero-copy.
 ///
 /// Both the image and blob device are memory-mapped for zero-copy access.

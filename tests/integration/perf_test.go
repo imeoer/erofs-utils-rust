@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +23,18 @@ import (
 //
 // Enable:        EROFS_RUN_PERF=1
 // C comparison:  EROFS_C_FUSE=/path/to/erofsfuse (auto-detected if omitted)
+// Tuning:
+//   EROFS_PERF_LARGE_FILE_COUNT  number of large files for read benchmarks (default: 8)
+//   EROFS_PERF_LARGE_FILE_MB     size in MiB of each large file (default: 64)
+//   EROFS_PERF_MEDIUM_FILE_COUNT number of medium files in corpus (default: 256)
+//   EROFS_PERF_MEDIUM_FILE_MB    size in MiB of each medium file (default: 1)
+//   EROFS_PERF_SMALL_FILE_COUNT  number of small files for stat benchmark (default: 10000)
+//   EROFS_PERF_FIO_SECS          fio benchmark duration in seconds (default: 20)
+//   EROFS_PERF_SEQ_THREADS       seq-read multi-thread job count (default: 4)
+//   EROFS_PERF_READDIR_DIRS   number of directories for readdir corpus (default: 128)
+//   EROFS_PERF_READDIR_FILES  files per directory for readdir corpus (default: 256)
+//   EROFS_PERF_READDIR_PASSES repeated os.ReadDir calls per directory in one iteration (default: 8)
+//   EROFS_PERF_META_SECS      metadata benchmark duration in seconds (default: 5)
 func TestPerf(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
@@ -80,23 +93,28 @@ func TestPerf(t *testing.T) {
 
 func makePerfCorpus(t *testing.T, dir string) {
 	c := texture.NewCorpus(t, dir)
+	largeFileCount := envInt("EROFS_PERF_LARGE_FILE_COUNT", 8)
+	largeFileMB := envInt("EROFS_PERF_LARGE_FILE_MB", 64)
+	mediumFileCount := envInt("EROFS_PERF_MEDIUM_FILE_COUNT", 256)
+	mediumFileMB := envInt("EROFS_PERF_MEDIUM_FILE_MB", 1)
+	smallFileCount := envInt("EROFS_PERF_SMALL_FILE_COUNT", 10000)
+	readdirDirCount := envInt("EROFS_PERF_READDIR_DIRS", 128)
+	readdirFilesPerDir := envInt("EROFS_PERF_READDIR_FILES", 256)
 
-	// 4 x 32 MB files for sequential throughput (128 MB)
-	for i := 0; i < 4; i++ {
-		c.CreateLargeFile(t, fmt.Sprintf("large/file_%d.bin", i), 32)
+	// Larger corpus for read benchmarks to amplify sequential/random read cost.
+	for i := 0; i < largeFileCount; i++ {
+		c.CreateLargeFile(t, fmt.Sprintf("large/file_%d.bin", i), largeFileMB)
 	}
-	// 128 x 1 MB files for random read (128 MB)
-	for i := 0; i < 128; i++ {
-		c.CreateRandomFile(t, fmt.Sprintf("medium/file_%04d.bin", i), 1<<20)
+	for i := 0; i < mediumFileCount; i++ {
+		c.CreateRandomFile(t, fmt.Sprintf("medium/file_%04d.bin", i), mediumFileMB<<20)
 	}
-	// 1000 small files for stat benchmark
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < smallFileCount; i++ {
 		c.CreateFile(t, fmt.Sprintf("small/file_%04d.txt", i),
 			[]byte(fmt.Sprintf("content of small file %d\n", i)))
 	}
-	// 10 dirs x 50 files for readdir benchmark
-	for d := 0; d < 10; d++ {
-		for f := 0; f < 50; f++ {
+	// Large directory fanout to amplify readdir cost and trigger repeated FUSE readdir calls.
+	for d := 0; d < readdirDirCount; d++ {
+		for f := 0; f < readdirFilesPerDir; f++ {
 			c.CreateFile(t, fmt.Sprintf("dirs/d%02d/f%03d.txt", d, f),
 				[]byte(fmt.Sprintf("d%d/f%d", d, f)))
 		}
@@ -222,6 +240,8 @@ func runFioJob(t *testing.T, fioBin string, args []string) *benchResult {
 func runBenchmarks(t *testing.T, fioBin, mntDir string) map[string]*benchResult {
 	results := make(map[string]*benchResult)
 	largeFile := filepath.Join(mntDir, "large/file_0.bin")
+	fioSeconds := envInt("EROFS_PERF_FIO_SECS", 20)
+	seqThreads := envInt("EROFS_PERF_SEQ_THREADS", 4)
 	require.FileExists(t, largeFile)
 
 	// 1. Sequential read throughput (128K blocks)
@@ -229,7 +249,7 @@ func runBenchmarks(t *testing.T, fioBin, mntDir string) map[string]*benchResult 
 	results["seq_read"] = runFioJob(t, fioBin, []string{
 		"--name=seq_read", "--filename=" + largeFile,
 		"--rw=read", "--bs=128k", "--direct=0",
-		"--numjobs=1", "--runtime=10", "--time_based", "--readonly",
+		"--numjobs=1", fmt.Sprintf("--runtime=%d", fioSeconds), "--time_based", "--readonly",
 	})
 
 	// 2. Random read IOPS (4K blocks)
@@ -237,7 +257,7 @@ func runBenchmarks(t *testing.T, fioBin, mntDir string) map[string]*benchResult 
 	results["rand_read_4k"] = runFioJob(t, fioBin, []string{
 		"--name=rand_read_4k", "--filename=" + largeFile,
 		"--rw=randread", "--bs=4k", "--direct=0",
-		"--numjobs=1", "--runtime=10", "--time_based", "--readonly",
+		"--numjobs=1", fmt.Sprintf("--runtime=%d", fioSeconds), "--time_based", "--readonly",
 	})
 
 	// 3. Multi-threaded sequential read (4 threads on same file)
@@ -245,7 +265,7 @@ func runBenchmarks(t *testing.T, fioBin, mntDir string) map[string]*benchResult 
 	results["seq_read_4t"] = runFioJob(t, fioBin, []string{
 		"--name=seq_read_4t", "--filename=" + largeFile,
 		"--rw=read", "--bs=128k", "--direct=0",
-		"--numjobs=4", "--runtime=10", "--time_based",
+		fmt.Sprintf("--numjobs=%d", seqThreads), fmt.Sprintf("--runtime=%d", fioSeconds), "--time_based",
 		"--readonly", "--group_reporting",
 	})
 
@@ -263,6 +283,7 @@ func runBenchmarks(t *testing.T, fioBin, mntDir string) map[string]*benchResult 
 // ---------- Go metadata benchmarks ----------
 
 func benchStat(t *testing.T, dir string) *benchResult {
+	metaDuration := time.Duration(envInt("EROFS_PERF_META_SECS", 5)) * time.Second
 	var files []string
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
@@ -274,7 +295,7 @@ func benchStat(t *testing.T, dir string) *benchResult {
 
 	iterations := 0
 	start := time.Now()
-	deadline := start.Add(5 * time.Second)
+	deadline := start.Add(metaDuration)
 	for time.Now().Before(deadline) {
 		for _, f := range files {
 			_, _ = os.Stat(f)
@@ -291,6 +312,8 @@ func benchStat(t *testing.T, dir string) *benchResult {
 }
 
 func benchReaddir(t *testing.T, dir string) *benchResult {
+	metaDuration := time.Duration(envInt("EROFS_PERF_META_SECS", 5)) * time.Second
+	passesPerDir := envInt("EROFS_PERF_READDIR_PASSES", 8)
 	var dirs []string
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -303,20 +326,34 @@ func benchReaddir(t *testing.T, dir string) *benchResult {
 
 	iterations := 0
 	start := time.Now()
-	deadline := start.Add(5 * time.Second)
+	deadline := start.Add(metaDuration)
 	for time.Now().Before(deadline) {
 		for _, d := range dirs {
-			_, _ = os.ReadDir(d)
+			for pass := 0; pass < passesPerDir; pass++ {
+				_, _ = os.ReadDir(d)
+			}
 		}
 		iterations++
 	}
 	elapsed := time.Since(start)
-	totalOps := float64(iterations * len(dirs))
+	totalOps := float64(iterations * len(dirs) * passesPerDir)
 	return &benchResult{
 		Name:     "readdir",
 		ReadIOPS: totalOps / elapsed.Seconds(),
 		ReadLat:  elapsed.Seconds() / totalOps * 1e6,
 	}
+}
+
+func envInt(key string, defaultValue int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }
 
 // ---------- result table ----------
@@ -333,9 +370,9 @@ func printResultsTable(t *testing.T, rust, c map[string]*benchResult) {
 		{"Random Read (4K)", "rand_read_4k", "IOPS", func(r *benchResult) float64 { return r.ReadIOPS }},
 		{"Random Read (4K) Lat", "rand_read_4k", "µs", func(r *benchResult) float64 { return r.ReadLat }},
 		{"Seq Read 4-thread", "seq_read_4t", "MB/s", func(r *benchResult) float64 { return r.ReadBW }},
-		{"Stat (1000 files)", "stat", "IOPS", func(r *benchResult) float64 { return r.ReadIOPS }},
+		{"Stat", "stat", "IOPS", func(r *benchResult) float64 { return r.ReadIOPS }},
 		{"Stat Latency", "stat", "µs", func(r *benchResult) float64 { return r.ReadLat }},
-		{"Readdir (10 dirs)", "readdir", "IOPS", func(r *benchResult) float64 { return r.ReadIOPS }},
+		{"Readdir", "readdir", "IOPS", func(r *benchResult) float64 { return r.ReadIOPS }},
 		{"Readdir Latency", "readdir", "µs", func(r *benchResult) float64 { return r.ReadLat }},
 	}
 

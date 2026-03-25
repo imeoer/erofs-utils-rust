@@ -2,7 +2,7 @@ use std::io;
 
 use crate::metadata::*;
 
-use super::{DirEntry, ErofsReader};
+use super::{CachedDirEntry, DirEntry, ErofsReader};
 
 impl ErofsReader {
     /// Get a zero-copy inode view from the mmap.
@@ -12,19 +12,66 @@ impl ErofsReader {
         ErofsInode::cast(data)
     }
 
-    /// Read directory entries from a directory inode.
-    pub fn read_dir(&self, nid: u64, inode: &ErofsInode<'_>) -> io::Result<Vec<DirEntry>> {
+    /// Iterate directory entries without materializing the whole directory in memory.
+    pub fn for_each_dir_entry<F>(
+        &self,
+        nid: u64,
+        inode: &ErofsInode<'_>,
+        mut cb: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(u64, u8, &[u8]) -> io::Result<bool>,
+    {
         let dir_size = inode.size() as usize;
         if dir_size == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let data = self.read_flat_data_vec(nid, inode, 0, dir_size)?;
-        Self::parse_dir_entries(&data, dir_size)
+
+        match self.read_flat_data(nid, inode, 0, dir_size) {
+            Ok(data) => Self::parse_dir_entries(data, dir_size, &mut cb),
+            Err(_) => {
+                let data = self.read_flat_data_vec(nid, inode, 0, dir_size)?;
+                Self::parse_dir_entries(&data, dir_size, &mut cb)
+            }
+        }
     }
 
-    fn parse_dir_entries(data: &[u8], dir_size: usize) -> io::Result<Vec<DirEntry>> {
-        let block_size = EROFS_BLOCK_SIZE as usize;
+    /// Read directory entries from a directory inode.
+    pub fn read_dir(&self, nid: u64, inode: &ErofsInode<'_>) -> io::Result<Vec<DirEntry>> {
         let mut entries = Vec::new();
+        self.for_each_dir_entry(nid, inode, |entry_nid, file_type, name| {
+            entries.push(DirEntry {
+                nid: entry_nid,
+                file_type,
+                name: String::from_utf8_lossy(name).into_owned(),
+            });
+            Ok(true)
+        })?;
+        Ok(entries)
+    }
+
+    pub(crate) fn read_dir_cached(
+        &self,
+        nid: u64,
+        inode: &ErofsInode<'_>,
+    ) -> io::Result<Vec<CachedDirEntry>> {
+        let mut entries = Vec::new();
+        self.for_each_dir_entry(nid, inode, |entry_nid, file_type, name| {
+            entries.push(CachedDirEntry {
+                nid: entry_nid,
+                file_type,
+                name: name.to_vec(),
+            });
+            Ok(true)
+        })?;
+        Ok(entries)
+    }
+
+    fn parse_dir_entries<F>(data: &[u8], dir_size: usize, cb: &mut F) -> io::Result<()>
+    where
+        F: FnMut(u64, u8, &[u8]) -> io::Result<bool>,
+    {
+        let block_size = EROFS_BLOCK_SIZE as usize;
         let mut pos = 0;
 
         while pos < dir_size {
@@ -63,18 +110,14 @@ impl ErofsReader {
                 if nameoff >= block_len || name_end > block_len {
                     break;
                 }
-                let name = String::from_utf8_lossy(&block_data[nameoff..name_end]).to_string();
-
-                entries.push(DirEntry {
-                    nid: de.nid(),
-                    file_type: de.file_type(),
-                    name,
-                });
+                if !cb(de.nid(), de.file_type(), &block_data[nameoff..name_end])? {
+                    return Ok(());
+                }
             }
 
             pos += block_size;
         }
-        Ok(entries)
+        Ok(())
     }
 
     /// Read flat data (FLAT_PLAIN / FLAT_INLINE) as an mmap slice.

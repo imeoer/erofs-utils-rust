@@ -144,3 +144,16 @@ make test-perf
 # Compare against C erofsfuse
 EROFS_C_FUSE=/path/to/erofsfuse make test-perf
 ```
+
+```
+Benchmark                     Unit          Rust             C     Ratio
+------------------------------------------------------------------------
+Sequential Read (128K)        MB/s        3005.6        2691.3     1.12x
+Random Read (4K)              IOPS       19168.1       22605.5     0.85x
+Random Read (4K) Lat            µs          51.1          43.3     0.85x
+Seq Read 4-thread             MB/s        6575.8        5694.9     1.15x
+Stat                          IOPS     1067967.0      841824.6     1.27x
+Stat Latency                    µs           0.9           1.2     1.27x
+Readdir                       IOPS       10398.9        3907.8     2.66x
+Readdir Latency                 µs          96.2         255.9     2.66x
+```
