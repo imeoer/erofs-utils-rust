@@ -49,6 +49,7 @@ func findBinary(name string) string {
 
 func requireBinary(t *testing.T, name string) string {
 	p := findBinary(name)
+	fmt.Println("PATH", p)
 	if p == "" {
 		t.Fatalf("%s not found on PATH or in target/{release,debug}/", name)
 	}

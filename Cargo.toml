@@ -27,6 +27,9 @@ async-trait = "0.1"
 fuse-backend-rs = { path = "../fuse-backend-rs", features = ["fusedev", "async-io"] }
 xattr = "1"
 
+[profile.release]
+debug = true
+
 [features]
 default = ["async-io"]
 async-io = []

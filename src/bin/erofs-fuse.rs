@@ -1,10 +1,9 @@
-// erofs-fuse — mount an EROFS image via FUSE using fuse-backend-rs async mode.
+// erofs-fuse — mount an EROFS image via FUSE.
 //
 // Usage:
 //   sudo erofs-fuse <image> <mountpoint> [--blobdev <path>]
 
 use std::io::{Error, Result};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,8 +14,7 @@ use signal_hook::iterator::Signals;
 use simple_logger::SimpleLogger;
 
 use fuse_backend_rs::api::server::Server;
-use fuse_backend_rs::async_util::AsyncExecutorState;
-use fuse_backend_rs::transport::{FuseDevTask, FuseSession};
+use fuse_backend_rs::transport::FuseSession;
 
 use mkfs_erofs::fs::{ErofsFs, ErofsReader};
 
@@ -44,7 +42,7 @@ struct Args {
 
 fn main() -> Result<()> {
     SimpleLogger::new()
-        .with_level(LevelFilter::Trace)
+        .with_level(LevelFilter::Info)
         .init()
         .unwrap();
 
@@ -80,32 +78,38 @@ fn main() -> Result<()> {
         .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
     info!("mounted on {}", args.mountpoint);
 
-    let buf_size = se.bufsize();
-    let state = AsyncExecutorState::new();
-
     for i in 0..args.threads {
-        let fuse_file = se
-            .clone_fuse_file()
+        let mut ch = se
+            .new_channel()
             .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
-        let fd = fuse_file.as_raw_fd();
         let server = server.clone();
-        let state = state.clone();
 
         std::thread::Builder::new()
             .name(format!("erofs_fuse_{}", i))
             .spawn(move || {
-                let _fuse_file = fuse_file;
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-
-                rt.block_on(async move {
-                    let mut task = FuseDevTask::new(buf_size, fd, server, state);
-                    info!("fuse worker {} started", i);
-                    task.poll_handler().await;
-                    warn!("fuse worker {} exits", i);
-                });
+                info!("fuse worker {} started", i);
+                loop {
+                    match ch.get_request() {
+                        Ok(Some((reader, writer))) => {
+                            if let Err(e) = server.handle_message(reader, writer.into(), None, None)
+                            {
+                                match e {
+                                    fuse_backend_rs::Error::EncodeMessage(_) => break,
+                                    _ => {
+                                        error!("handle fuse message: {:?}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("get fuse request: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                warn!("fuse worker {} exits", i);
             })
             .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
     }
@@ -118,7 +122,6 @@ fn main() -> Result<()> {
     }
 
     info!("unmounting...");
-    state.quiesce();
     se.umount()
         .map_err(|e| Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
     se.wake()

@@ -5,7 +5,6 @@ pub mod fuse;
 pub use self::fuse::ErofsFs;
 
 use std::io;
-use std::os::unix::io::OwnedFd;
 
 use memmap2::Mmap;
 use tokio::fs::File as TokioFile;
@@ -19,20 +18,13 @@ pub struct DirEntry {
     pub name: String,
 }
 
-// Safety: ErofsReader fields are all safe to share across threads:
-// - mmap: Mmap is Send+Sync (immutable shared memory).
-// - blob_fd: OwnedFd is Send+Sync; we only call pread() which is thread-safe.
-unsafe impl Send for ErofsReader {}
-unsafe impl Sync for ErofsReader {}
-
 /// EROFS image reader — lock-free, zero-copy.
 ///
-/// Image metadata is accessed through mmap. On-disk structs are cast
-/// directly from the mapped memory (ErofsInode, ErofsDirent, ErofsChunkIndex).
-/// Blob device data is read through pread (atomic offset + read, lock-free).
+/// Both the image and blob device are memory-mapped for zero-copy access.
+/// On-disk structs are cast directly from the mapped memory.
 pub struct ErofsReader {
     pub(crate) mmap: Mmap,
-    pub(crate) blob_fd: Option<OwnedFd>,
+    pub(crate) blob_mmap: Option<Mmap>,
     pub(crate) sb_offset: usize,
 }
 
@@ -56,18 +48,20 @@ impl ErofsReader {
             }
         }
 
-        let blob_fd = match blob_path {
+        let blob_mmap = match blob_path {
             Some(p) => {
                 let blob_tokio = TokioFile::open(p).await?;
                 let blob_std = blob_tokio.into_std().await;
-                Some(OwnedFd::from(blob_std))
+                // SAFETY: file opened read-only, never modified.
+                let bm = unsafe { Mmap::map(&blob_std) }?;
+                Some(bm)
             }
             None => None,
         };
 
         Ok(Self {
             mmap,
-            blob_fd,
+            blob_mmap,
             sb_offset,
         })
     }
@@ -102,6 +96,25 @@ impl ErofsReader {
             ));
         }
         Ok(&self.mmap[offset..end])
+    }
+
+    pub(crate) fn blob_mmap_slice(&self, offset: usize, len: usize) -> io::Result<&[u8]> {
+        let blob = self.blob_mmap.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "blob device not available")
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "blob offset + len overflow")
+        })?;
+        if end > blob.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blob mmap read out of bounds: offset={}, len={}, blob_len={}",
+                    offset, len, blob.len()
+                ),
+            ));
+        }
+        Ok(&blob[offset..end])
     }
 
     pub(crate) fn nid_to_offset(&self, nid: u64) -> usize {

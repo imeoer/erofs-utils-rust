@@ -92,9 +92,22 @@ impl FileSystem for ErofsFs {
 
     fn init(
         &self,
-        _capable: fuse_backend_rs::abi::fuse_abi::FsOptions,
+        capable: fuse_backend_rs::abi::fuse_abi::FsOptions,
     ) -> io::Result<fuse_backend_rs::abi::fuse_abi::FsOptions> {
-        Ok(fuse_backend_rs::abi::fuse_abi::FsOptions::empty())
+        use fuse_backend_rs::abi::fuse_abi::FsOptions;
+
+        // Request all capabilities that benefit a read-only filesystem.
+        let want = FsOptions::ASYNC_READ       // allow parallel reads
+            | FsOptions::BIG_WRITES            // enable large max_write (1MB)
+            | FsOptions::MAX_PAGES             // use 256 pages (1MB) for max_write/max_read
+            | FsOptions::PARALLEL_DIROPS       // parallel directory operations
+            | FsOptions::DO_READDIRPLUS        // READDIRPLUS support
+            | FsOptions::READDIRPLUS_AUTO      // auto-READDIRPLUS
+            | FsOptions::ASYNC_DIO             // async direct I/O
+            | FsOptions::CACHE_SYMLINKS;       // cache symlink targets
+
+        // Negotiate: only enable what the kernel also supports.
+        Ok(capable & want)
     }
 
     fn destroy(&self) {}
@@ -176,8 +189,7 @@ impl FileSystem for ErofsFs {
     ) -> io::Result<usize> {
         let nid = self.to_nid(inode);
         let vi = self.reader.inode(nid)?;
-        let data = self.reader.read_file_data_sync(nid, &vi, offset, size)?;
-        w.write(&data)
+        self.reader.write_file_data_to(nid, &vi, offset, size, w)
     }
 
     fn readlink(&self, _ctx: &Context, inode: u64) -> io::Result<Vec<u8>> {
@@ -423,7 +435,11 @@ impl fuse_backend_rs::api::filesystem::AsyncFileSystem for ErofsFs {
     ) -> io::Result<usize> {
         let nid = self.to_nid(inode);
         let vi = self.reader.inode(nid)?;
-        let data = self.reader.read_file_data(nid, &vi, offset, size).await?;
+        // Use sync read path directly — each worker runs a single-threaded
+        // tokio runtime with only one FUSE task, so blocking is equivalent to
+        // awaiting and avoids spawn_blocking overhead (thread pool dispatch,
+        // cross-thread channel, Vec allocation per chunk).
+        let data = self.reader.read_file_data_sync(nid, &vi, offset, size)?;
         w.write(&data)
     }
 
